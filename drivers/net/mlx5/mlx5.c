@@ -223,6 +223,16 @@ struct txq {
 	struct ibv_exp_res_domain *rd; /* Resource Domain. */
 };
 
+enum rss_qp_type {
+	TCP_IPv4 = 0,
+	UDP_IPV4,
+//	TCP_IPv6,
+//	UDP_IPv6,
+	IPv4,
+//	IPv6,
+	NON_IP,
+};
+
 struct hash_rxq {
 	struct priv *priv; /* Back pointer to private data. */
 	struct ibv_qp *qp; /* RX hash QP. */
@@ -231,6 +241,7 @@ struct hash_rxq {
 	struct ibv_flow *mac_flow[MLX5_MAX_MAC_ADDRESSES][MLX5_MAX_VLAN_IDS];
 	struct ibv_flow *promisc_flow; /* Promiscuous flow. */
 	struct ibv_flow *allmulti_flow; /* Multicast flow. */
+	enum rss_qp_type type;
 };
 
 struct priv {
@@ -680,21 +691,26 @@ priv_create_hash_rxqs(struct priv *priv)
 		/* UDPv4. */
 		(IBV_EXP_RX_HASH_SRC_IPV4 | IBV_EXP_RX_HASH_DST_IPV4 |
 		 IBV_EXP_RX_HASH_SRC_PORT_UDP | IBV_EXP_RX_HASH_DST_PORT_UDP),
-		/* TCPv6. */
+		/* TCPv6 */
+		 /*
 		(IBV_EXP_RX_HASH_SRC_IPV6 | IBV_EXP_RX_HASH_DST_IPV6 |
 		 IBV_EXP_RX_HASH_SRC_PORT_TCP | IBV_EXP_RX_HASH_DST_PORT_TCP),
-		/* UDPv6. */
+		 */
+		/* UDPv6 */
+		 /*
 		(IBV_EXP_RX_HASH_SRC_IPV6 | IBV_EXP_RX_HASH_DST_IPV6 |
 		 IBV_EXP_RX_HASH_SRC_PORT_UDP | IBV_EXP_RX_HASH_DST_PORT_UDP),
+		 */
 		/* Other IPv4. */
 		(IBV_EXP_RX_HASH_SRC_IPV4 | IBV_EXP_RX_HASH_DST_IPV4),
 		/* Other IPv6. */
+		/*
 		(IBV_EXP_RX_HASH_SRC_IPV6 | IBV_EXP_RX_HASH_DST_IPV6),
+		*/
 		/* None, used for everything else. */
 		0,
 	};
 
-	DEBUG("allocating RX hash queues for %u WQs", priv->rxqs_n);
 	assert(priv->ind_table == NULL);
 	assert(priv->hash_rxqs == NULL);
 	assert(priv->hash_rxqs_n == 0);
@@ -722,6 +738,9 @@ priv_create_hash_rxqs(struct priv *priv)
 	unsigned int i;
 	unsigned int j;
 	int err = 0;
+
+	DEBUG("allocating %d RX hash queues for %u WQs", hash_rxqs_n, priv->rxqs_n);
+
 
 	if (wqs_n < priv->rxqs_n) {
 		ERROR("cannot handle this many RX queues (%u)", priv->rxqs_n);
@@ -795,6 +814,9 @@ priv_create_hash_rxqs(struct priv *priv)
 			}
 			goto error;
 		}
+
+		hash_rxq->type =(enum rss_qp_type)j;
+		DEBUG("RSS Type is %d",hash_rxq->type);
 	}
 	priv->ind_table = ind_table;
 	priv->hash_rxqs = hash_rxqs;
@@ -2179,21 +2201,103 @@ priv_mac_addrs_disable(struct priv *priv)
  */
 static int
 hash_rxq_add_flow(struct hash_rxq *hash_rxq, unsigned int mac_index,
-		  unsigned int vlan_index)
+		  unsigned int vlan_index, unsigned is_promisc)
 {
 	struct ibv_flow *flow;
 	struct priv *priv = hash_rxq->priv;
-	const uint8_t (*mac)[ETHER_ADDR_LEN] =
-			(const uint8_t (*)[ETHER_ADDR_LEN])
-			priv->mac[mac_index].addr_bytes;
 
 	/* Allocate flow specification on the stack. */
+
 	struct __attribute__((packed)) {
 		struct ibv_flow_attr attr;
-		struct ibv_flow_spec_eth spec;
+		struct ibv_flow_spec_eth spec_eth;
+		struct ibv_flow_spec_ipv4 spec_ipv4;
+		struct ibv_flow_spec_tcp_udp spec_tcp_udp;
 	} data;
+
 	struct ibv_flow_attr *attr = &data.attr;
-	struct ibv_flow_spec_eth *spec = &data.spec;
+	struct ibv_flow_spec_eth *spec_eth = &data.spec_eth;
+	struct ibv_flow_spec_ipv4 *spec_ipv4 = &data.spec_ipv4;
+	struct ibv_flow_spec_tcp_udp *spec_tcp_udp = &data.spec_tcp_udp;
+
+	*attr = (struct ibv_flow_attr){
+			.type = IBV_FLOW_ATTR_NORMAL,
+			.port = priv->port,
+			.flags = 0
+	};
+
+	if( !is_promisc ) {
+		const uint8_t (*mac)[ETHER_ADDR_LEN] =
+				(const uint8_t (*)[ETHER_ADDR_LEN])
+				priv->mac[mac_index].addr_bytes;
+
+		*spec_eth = (struct ibv_flow_spec_eth){
+			.type = IBV_FLOW_SPEC_ETH,
+			.size = sizeof(*spec_eth),
+			.val = {
+				.dst_mac = {
+						(*mac)[0], (*mac)[1], (*mac)[2],
+						(*mac)[3], (*mac)[4], (*mac)[5]
+				},
+				.vlan_tag = ((vlan_index != -1u) ?
+						htons(priv->vlan_filter[vlan_index].id) :
+						0),
+			},
+			.mask = {
+					.dst_mac = "\xff\xff\xff\xff\xff\xff",
+					.vlan_tag = ((vlan_index != -1u) ? htons(0xfff) : 0),
+			}
+		};
+
+		DEBUG("%p: QP type = %d number of specs = %d adding MAC address %02x:%02x:%02x:%02x:%02x:%02x index %u"
+			      " (VLAN %s %" PRIu16 ")",
+			      (void *)hash_rxq,
+			      hash_rxq->type,
+			      data.attr.num_of_specs,
+			      (*mac)[0], (*mac)[1], (*mac)[2], (*mac)[3], (*mac)[4], (*mac)[5],
+			      mac_index,
+			      ((vlan_index != -1u) ? "ID" : "index"),
+			      ((vlan_index != -1u) ? priv->vlan_filter[vlan_index].id : -1u));
+	}
+	else {
+		*spec_eth = (struct ibv_flow_spec_eth){
+			.type = IBV_FLOW_SPEC_ETH,
+			.size = sizeof(*spec_eth),
+		};
+	}
+
+	*spec_ipv4 = (struct ibv_flow_spec_ipv4){
+		.type = IBV_FLOW_SPEC_IPV4,
+		.size = sizeof(*spec_ipv4),
+	};
+
+	switch( hash_rxq->type ) {
+		case TCP_IPv4:
+			*spec_tcp_udp = (struct ibv_flow_spec_tcp_udp){
+				.type = IBV_FLOW_SPEC_TCP,
+				.size = sizeof(*spec_tcp_udp),
+			};
+			data.attr.priority = 0;
+			data.attr.num_of_specs = 3;
+			break;
+		case UDP_IPV4:
+			*spec_tcp_udp = (struct ibv_flow_spec_tcp_udp){
+				.type = IBV_FLOW_SPEC_UDP,
+				.size = sizeof(*spec_tcp_udp),
+			};
+			data.attr.priority = 0;
+			data.attr.num_of_specs = 3;
+			break;
+		case IPv4:
+			data.attr.priority = 1;
+			data.attr.num_of_specs = 2;
+			break;
+
+		case NON_IP:
+			data.attr.priority = 2;
+			data.attr.num_of_specs = 1;
+			break;
+	}
 
 	assert(mac_index < elemof(priv->mac));
 	assert((vlan_index < elemof(priv->vlan_filter)) || (vlan_index == -1u));
@@ -2201,37 +2305,8 @@ hash_rxq_add_flow(struct hash_rxq *hash_rxq, unsigned int mac_index,
 	 * No padding must be inserted by the compiler between attr and spec.
 	 * This layout is expected by libibverbs.
 	 */
-	assert(((uint8_t *)attr + sizeof(*attr)) == (uint8_t *)spec);
-	*attr = (struct ibv_flow_attr){
-		.type = IBV_FLOW_ATTR_NORMAL,
-		.num_of_specs = 1,
-		.port = priv->port,
-		.flags = 0
-	};
-	*spec = (struct ibv_flow_spec_eth){
-		.type = IBV_FLOW_SPEC_ETH,
-		.size = sizeof(*spec),
-		.val = {
-			.dst_mac = {
-				(*mac)[0], (*mac)[1], (*mac)[2],
-				(*mac)[3], (*mac)[4], (*mac)[5]
-			},
-			.vlan_tag = ((vlan_index != -1u) ?
-				     htons(priv->vlan_filter[vlan_index].id) :
-				     0),
-		},
-		.mask = {
-			.dst_mac = "\xff\xff\xff\xff\xff\xff",
-			.vlan_tag = ((vlan_index != -1u) ? htons(0xfff) : 0),
-		}
-	};
-	DEBUG("%p: adding MAC address %02x:%02x:%02x:%02x:%02x:%02x index %u"
-	      " (VLAN %s %" PRIu16 ")",
-	      (void *)hash_rxq,
-	      (*mac)[0], (*mac)[1], (*mac)[2], (*mac)[3], (*mac)[4], (*mac)[5],
-	      mac_index,
-	      ((vlan_index != -1u) ? "ID" : "index"),
-	      ((vlan_index != -1u) ? priv->vlan_filter[vlan_index].id : -1u));
+	assert(((uint8_t *)attr + sizeof(*attr)) == (uint8_t *)spec_eth);
+
 	/* Create related flow. */
 	errno = 0;
 	flow = ibv_create_flow(hash_rxq->qp, attr);
@@ -2246,8 +2321,13 @@ hash_rxq_add_flow(struct hash_rxq *hash_rxq, unsigned int mac_index,
 	}
 	if (vlan_index == -1u)
 		vlan_index = 0;
-	assert(hash_rxq->mac_flow[mac_index][vlan_index] == NULL);
-	hash_rxq->mac_flow[mac_index][vlan_index] = flow;
+	if ( !is_promisc ) {
+		assert(hash_rxq->mac_flow[mac_index][vlan_index] == NULL);
+		hash_rxq->mac_flow[mac_index][vlan_index] = flow;
+	}
+	else
+		hash_rxq->promisc_flow = flow;
+
 	return 0;
 }
 
@@ -2278,7 +2358,7 @@ hash_rxq_mac_addr_add(struct hash_rxq *hash_rxq, unsigned int mac_index)
 		if (!priv->vlan_filter[i].enabled)
 			continue;
 		/* Create related flow. */
-		ret = hash_rxq_add_flow(hash_rxq, mac_index, i);
+		ret = hash_rxq_add_flow(hash_rxq, mac_index, i, 0);
 		if (!ret) {
 			vlans++;
 			continue;
@@ -2292,7 +2372,7 @@ hash_rxq_mac_addr_add(struct hash_rxq *hash_rxq, unsigned int mac_index)
 	}
 	/* In case there is no VLAN filter. */
 	if (!vlans) {
-		ret = hash_rxq_add_flow(hash_rxq, mac_index, -1);
+		ret = hash_rxq_add_flow(hash_rxq, mac_index, -1, 0);
 		if (ret)
 			return ret;
 	}
@@ -2476,6 +2556,7 @@ hash_rxq_allmulticast_enable(struct hash_rxq *hash_rxq)
 	if (hash_rxq->allmulti_flow != NULL)
 		return EBUSY;
 	errno = 0;
+	hash_rxq_add_flow(hash_rxq, 0, 0, 1);
 	flow = ibv_create_flow(hash_rxq->qp, &attr);
 	if (flow == NULL) {
 		/* It's not clear whether errno is always set in this case. */
@@ -2578,31 +2659,21 @@ priv_allmulticast_disable(struct priv *priv)
 static int
 hash_rxq_promiscuous_enable(struct hash_rxq *hash_rxq)
 {
-	struct ibv_flow *flow;
-	struct ibv_flow_attr attr = {
-		.type = IBV_FLOW_ATTR_ALL_DEFAULT,
-		.num_of_specs = 0,
-		.port = hash_rxq->priv->port,
-		.flags = 0
-	};
-
 	if (hash_rxq->priv->vf)
 		return 0;
 	DEBUG("%p: enabling promiscuous mode", (void *)hash_rxq);
 	if (hash_rxq->promisc_flow != NULL)
 		return EBUSY;
 	errno = 0;
-	flow = ibv_create_flow(hash_rxq->qp, &attr);
-	if (flow == NULL) {
+	if ( hash_rxq_add_flow(hash_rxq, 0, 0, 1) ) {
 		/* It's not clear whether errno is always set in this case. */
-		ERROR("%p: flow configuration failed, errno=%d: %s",
+		ERROR("%p: promisc flow configuration failed, errno=%d: %s",
 		      (void *)hash_rxq, errno,
 		      (errno ? strerror(errno) : "Unknown error"));
 		if (errno)
 			return errno;
 		return EINVAL;
 	}
-	hash_rxq->promisc_flow = flow;
 	DEBUG("%p: promiscuous mode enabled", (void *)hash_rxq);
 	return 0;
 }
