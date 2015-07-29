@@ -277,6 +277,8 @@ struct priv {
 	struct txq *(*txqs)[]; /* TX queues. */
 	/* Indirection table referencing all RX WQs. */
 	struct ibv_exp_rwq_ind_table *ind_table;
+	/* Indirection table for NON IP RSS QP. */
+	struct ibv_exp_rwq_ind_table *ind_table_non_ip;
 	/* RX hash QPs that feed the indirection table. */
 	struct hash_rxq (*hash_rxqs)[];
 	unsigned int hash_rxqs_n; /* RX hash QPs array size. */
@@ -712,6 +714,7 @@ priv_create_hash_rxqs(struct priv *priv)
 	};
 
 	assert(priv->ind_table == NULL);
+	assert(priv->ind_table_non_ip == NULL);
 	assert(priv->hash_rxqs == NULL);
 	assert(priv->hash_rxqs_n == 0);
 	assert(priv->pd != NULL);
@@ -729,7 +732,15 @@ priv_create_hash_rxqs(struct priv *priv)
 		.ind_tbl = wqs,
 		.comp_mask = 0,
 	};
+
 	struct ibv_exp_rwq_ind_table *ind_table = NULL;
+
+	/* IN case we have more then one RX queue need to configure
+	 * NON_IP QP with flags=0 that points to indirectiona table
+	 * with only one WQ
+	 */
+	struct ibv_exp_rwq_ind_table *ind_table_non_ip = NULL;
+
 	/* If only one RX queue is configured, RSS is not needed and a single
 	 * empty hash entry is used (last rss_hash_table[] entry). */
 	unsigned int hash_rxqs_n =
@@ -755,20 +766,39 @@ priv_create_hash_rxqs(struct priv *priv)
 	/* When the number of RX queues is not a power of two, the remaining
 	 * table entries are padded with reused WQs and hashes are not spread
 	 * uniformly. */
-	for (i = 0, j = 0; (i != wqs_n); ++i) {
-		wqs[i] = (*priv->rxqs)[j]->wq;
-		if (++j == priv->rxqs_n)
-			j = 0;
+	/* Only in case we have more then 1 RX queue ind_table will be careted */
+	if (wqs_n > 1) {
+		DEBUG("Creating indirectiona table for all RSS QPs except the NON IP");
+		for (i = 0, j = 0; (i != wqs_n); ++i) {
+			wqs[i] = (*priv->rxqs)[j]->wq;
+			if (++j == priv->rxqs_n)
+				j = 0;
+		}
+		errno = 0;
+		ind_table = ibv_exp_create_rwq_ind_table(priv->ctx, &ind_init_attr);
+		if (ind_table == NULL) {
+			/* Not clear whether errno is set. */
+			err = (errno ? errno : EINVAL);
+			ERROR("RX indirection table creation failed with error %d: %s",
+			      err, strerror(err));
+			goto error;
+		}
 	}
+
+	DEBUG("Creating indirectional table for NON RSS QP");
+	/* Create indirection table with size = 1 */
+	ind_init_attr.log_ind_tbl_size = 0;
+	ind_init_attr.ind_tbl = &((*priv->rxqs)[0]->wq);
 	errno = 0;
-	ind_table = ibv_exp_create_rwq_ind_table(priv->ctx, &ind_init_attr);
-	if (ind_table == NULL) {
+	ind_table_non_ip = ibv_exp_create_rwq_ind_table(priv->ctx, &ind_init_attr);
+	if (ind_table_non_ip == NULL) {
 		/* Not clear whether errno is set. */
 		err = (errno ? errno : EINVAL);
 		ERROR("RX indirection table creation failed with error %d: %s",
 		      err, strerror(err));
 		goto error;
 	}
+
 	/* Allocate array that holds hash RX queues and related data. */
 	hash_rxqs = rte_malloc(__func__, sizeof(*hash_rxqs), 0);
 	if (hash_rxqs == NULL) {
@@ -790,6 +820,11 @@ priv_create_hash_rxqs(struct priv *priv)
 			.rx_hash_fields_mask = rss_hash_table[j],
 			.rwq_ind_tbl = ind_table,
 		};
+		/* NON IP QP */
+		if( j == (elemof(rss_hash_table) - 1)) {
+			hash_conf.rwq_ind_tbl = ind_table_non_ip;
+		}
+
 		struct ibv_exp_qp_init_attr qp_init_attr = {
 			.max_inl_recv = 0, /* Currently not supported. */
 			.qp_type = IBV_QPT_RAW_PACKET,
@@ -819,6 +854,7 @@ priv_create_hash_rxqs(struct priv *priv)
 		DEBUG("RSS Type is %d",hash_rxq->type);
 	}
 	priv->ind_table = ind_table;
+	priv->ind_table_non_ip = ind_table_non_ip;
 	priv->hash_rxqs = hash_rxqs;
 	priv->hash_rxqs_n = hash_rxqs_n;
 	assert(err == 0);
@@ -827,6 +863,8 @@ error:
 	rte_free(hash_rxqs);
 	if (ind_table != NULL)
 		claim_zero(ibv_exp_destroy_rwq_ind_table(ind_table));
+	if (ind_table_non_ip != NULL)
+		claim_zero(ibv_exp_destroy_rwq_ind_table(ind_table_non_ip));
 	return err;
 }
 
@@ -844,7 +882,7 @@ priv_destroy_hash_rxqs(struct priv *priv)
 	DEBUG("destroying %u RX hash queues", priv->hash_rxqs_n);
 	if (priv->hash_rxqs_n == 0) {
 		assert(priv->hash_rxqs == NULL);
-		assert(priv->ind_table == NULL);
+		assert(priv->ind_table_non_ip == NULL);
 		return;
 	}
 	for (i = 0; (i != priv->hash_rxqs_n); ++i) {
@@ -864,8 +902,11 @@ priv_destroy_hash_rxqs(struct priv *priv)
 	priv->hash_rxqs_n = 0;
 	rte_free(priv->hash_rxqs);
 	priv->hash_rxqs = NULL;
-	claim_zero(ibv_exp_destroy_rwq_ind_table(priv->ind_table));
+	if(priv->ind_table)
+		claim_zero(ibv_exp_destroy_rwq_ind_table(priv->ind_table));
+	claim_zero(ibv_exp_destroy_rwq_ind_table(priv->ind_table_non_ip));
 	priv->ind_table = NULL;
+	priv->ind_table_non_ip = NULL;
 }
 
 /* Device configuration. */
