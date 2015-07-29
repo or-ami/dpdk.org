@@ -761,11 +761,11 @@ priv_create_hash_rxqs(struct priv *priv)
 	for (i = 0, j = (elemof(rss_hash_table) - hash_rxqs_n);
 	     (j != elemof(rss_hash_table));
 	     ++i, ++j) {
+		DEBUG("Creating RSS QP #%d\n", j);
 		struct hash_rxq *hash_rxq = &(*hash_rxqs)[i];
 
 		struct ibv_exp_rx_hash_conf hash_conf = {
-			/* Typo in the API, should read "TOEPLITZ". */
-			.rx_hash_function = IBV_EXP_RX_HASH_FUNC_TOEPLTIZ,
+			.rx_hash_function = IBV_EXP_RX_HASH_FUNC_TOEPLITZ,
 			.rx_hash_key_len = sizeof(rss_hash_key),
 			.rx_hash_key = rss_hash_key,
 			.rx_hash_fields_mask = rss_hash_table[j],
@@ -778,9 +778,10 @@ priv_create_hash_rxqs(struct priv *priv)
 				      IBV_EXP_QP_INIT_ATTR_RX_HASH),
 			.pd = priv->pd,
 			.rx_hash_conf = &hash_conf,
+			.port_num = priv->port,
 		};
 
-		*hash_rxq = (struct hash_rxq){
+		*hash_rxq = (struct hash_rxq) {
 			.priv = priv,
 			.qp = ibv_exp_create_qp(priv->ctx, &qp_init_attr),
 		};
@@ -3555,11 +3556,14 @@ rxq_setup(struct rte_eth_dev *dev, struct rxq *rxq, uint16_t desc,
 		ret = EIO;
 		goto error;
 	}
+
 	mod = (struct ibv_exp_wq_attr){
-		.attr_mask = IBV_EXP_WQ_ATTR_STATE,
+		.curr_wq_state = tmpl.wq->state,
+		.attr_mask = IBV_EXP_WQ_ATTR_STATE | IBV_EXP_WQ_ATTR_CURR_STATE,
 		.wq_state = IBV_EXP_WQS_RDY,
 	};
 	ret = ibv_exp_modify_wq(tmpl.wq, &mod);
+
 	if (ret) {
 		ERROR("%p: WQ state to IBV_EXP_WQS_RDY failed: %s",
 		      (void *)dev, strerror(ret));
