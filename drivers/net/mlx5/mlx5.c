@@ -3421,6 +3421,17 @@ rxq_rehash(struct rte_eth_dev *dev, struct rxq *rxq)
 	rxq->elts_n = 0;
 	rte_free(rxq->elts.sp);
 	rxq->elts.sp = NULL;
+	/* Change queue state to ready */
+	
+	mod = (struct ibv_exp_wq_attr){
+		.attr_mask = IBV_EXP_WQ_ATTR_STATE,
+		.wq_state = IBV_EXP_WQS_RDY,
+	};
+	err = ibv_exp_modify_wq(tmpl.wq, &mod);
+	if (err)
+		ERROR("%p: WQ state to IBV_EXP_WQS_RDY failed: %s",
+		      (void *)dev, strerror(err));
+	
 	/* Post SGEs. */
 	assert(tmpl.if_wq != NULL);
 	if (tmpl.sp) {
@@ -3453,14 +3464,7 @@ rxq_rehash(struct rte_eth_dev *dev, struct rxq *rxq)
 		err = EIO;
 		goto skip_rdy;
 	}
-	mod = (struct ibv_exp_wq_attr){
-		.attr_mask = IBV_EXP_WQ_ATTR_STATE,
-		.wq_state = IBV_EXP_WQS_RDY,
-	};
-	err = ibv_exp_modify_wq(tmpl.wq, &mod);
-	if (err)
-		ERROR("%p: WQ state to IBV_EXP_WQS_RDY failed: %s",
-		      (void *)dev, strerror(err));
+	
 skip_rdy:
 	*rxq = tmpl;
 	assert(err >= 0);
@@ -3637,6 +3641,20 @@ rxq_setup(struct rte_eth_dev *dev, struct rxq *rxq, uint16_t desc,
 		      (void *)dev, status);
 		goto error;
 	}
+	/*Change queue state to ready */
+	mod = (struct ibv_exp_wq_attr){
+		.curr_wq_state = tmpl.wq->state,
+		.attr_mask = IBV_EXP_WQ_ATTR_STATE | IBV_EXP_WQ_ATTR_CURR_STATE,
+		.wq_state = IBV_EXP_WQS_RDY,
+	};
+	ret = ibv_exp_modify_wq(tmpl.wq, &mod);
+
+	if (ret) {
+		ERROR("%p: WQ state to IBV_EXP_WQS_RDY failed: %s",
+		      (void *)dev, strerror(ret));
+		goto error;
+	}
+	
 	/* Post SGEs.*/
 	if (tmpl.sp) {
 		struct rxq_elt_sp (*elts)[tmpl.elts_n] = tmpl.elts.sp;
@@ -3669,18 +3687,6 @@ rxq_setup(struct rte_eth_dev *dev, struct rxq *rxq, uint16_t desc,
 		goto error;
 	}
 
-	mod = (struct ibv_exp_wq_attr){
-		.curr_wq_state = tmpl.wq->state,
-		.attr_mask = IBV_EXP_WQ_ATTR_STATE | IBV_EXP_WQ_ATTR_CURR_STATE,
-		.wq_state = IBV_EXP_WQS_RDY,
-	};
-	ret = ibv_exp_modify_wq(tmpl.wq, &mod);
-
-	if (ret) {
-		ERROR("%p: WQ state to IBV_EXP_WQS_RDY failed: %s",
-		      (void *)dev, strerror(ret));
-		goto error;
-	}
 	/* Clean up rxq in case we're reinitializing it. */
 	DEBUG("%p: cleaning-up old rxq just in case", (void *)rxq);
 	rxq_cleanup(rxq);
