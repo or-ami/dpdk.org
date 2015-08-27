@@ -4605,6 +4605,13 @@ static const struct eth_dev_ops mlx4_dev_ops = {
 	.fdir_set_masks = NULL
 };
 
+
+/* initializing the callbacks for a secondary with NULL
+ * will cause the EAL to return an error (but not crash).
+ */
+
+static const struct eth_dev_ops mlx4_dev_ops_secondary = { 0 };
+
 /**
  * Get PCI information from struct ibv_device.
  *
@@ -4872,6 +4879,25 @@ mlx4_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		mlx4_dev[idx].ports |= test;
 
 		/* from rte_ethdev.c */
+		{
+			char name[RTE_ETH_NAME_MAX_LEN];
+
+			snprintf(name, sizeof(name), "%s port %u",
+			ibv_get_device_name(ibv_dev), port);
+			eth_dev = rte_eth_dev_allocate(name, RTE_ETH_DEV_PCI);
+		}
+		if (eth_dev == NULL) {
+			ERROR("can not allocate rte ethdev");
+			err = ENOMEM;
+			goto port_error;
+		}
+
+		if (rte_eal_process_type() != RTE_PROC_PRIMARY) {
+			eth_dev->dev_ops = & mlx4_dev_ops_secondary;
+			return 0;
+		}
+
+		/* from rte_ethdev.c */
 		priv = rte_zmalloc("ethdev private structure",
 				   sizeof(*priv),
 				   RTE_CACHE_LINE_SIZE);
@@ -4992,20 +5018,6 @@ mlx4_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 		/* Get actual MTU if possible. */
 		priv_get_mtu(priv, &priv->mtu);
 		DEBUG("port %u MTU is %u", priv->port, priv->mtu);
-
-		/* from rte_ethdev.c */
-		{
-			char name[RTE_ETH_NAME_MAX_LEN];
-
-			snprintf(name, sizeof(name), "%s port %u",
-				 ibv_get_device_name(ibv_dev), port);
-			eth_dev = rte_eth_dev_allocate(name, RTE_ETH_DEV_PCI);
-		}
-		if (eth_dev == NULL) {
-			ERROR("can not allocate rte ethdev");
-			err = ENOMEM;
-			goto port_error;
-		}
 
 		eth_dev->data->dev_private = priv;
 		eth_dev->pci_dev = pci_dev;
