@@ -4894,6 +4894,8 @@ mlx4_pci_devinit(struct rte_pci_driver *pci_drv, struct rte_pci_device *pci_dev)
 
 		if (rte_eal_process_type() != RTE_PROC_PRIMARY) {
 			eth_dev->dev_ops = & mlx4_dev_ops_secondary;
+			eth_dev->rx_pkt_burst = removed_rx_burst;
+			eth_dev->tx_pkt_burst = removed_tx_burst;
 			return 0;
 		}
 
